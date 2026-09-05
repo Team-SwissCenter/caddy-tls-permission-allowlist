@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned rather than read from go.mod: the RPM build hosts run go1.26.5, and
+  # CI compiling with what actually ships is the point. Deliberately without
+  # check-latest, which would fetch the newest 1.26.x and defeat that.
+  GO_VERSION: "1.26.5"
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Kept despite .golangci.yml enabling govet: measured, the lint job does
+      # NOT report everything `go vet` does (a fmt.Printf with a missing
+      # argument is caught here and not there). gofmt is not duplicated here
+      # because the lint job demonstrably does catch that.
+      - name: go vet
+        run: go vet ./...
+
+      # -race is the reason this job exists at all: the module keeps its
+      # allow-list and health state behind mutexes and mutates them from a
+      # polling goroutine while handshakes read them.
+      - name: go test -race
+        run: go test -race -count=1 -cover ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Runs the linter set declared in .golangci.yml. Without this job that
+      # file is decoration: it claims errcheck/staticcheck/revive and friends
+      # are enforced while nothing ever invokes them.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+
+  build-into-caddy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The failure that matters on a Caddy upgrade is "no longer links into
+      # Caddy", which no unit test can catch. Building a real binary and asking
+      # it for the module does.
+      #
+      # The Caddy version is taken from go.mod rather than left to xcaddy, which
+      # would otherwise build the LATEST release: CI would then quietly test
+      # against a version this module does not declare and the fleet does not
+      # run. Bumping go.mod is what makes this job test a new Caddy.
+      - name: Build Caddy with this module
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          caddy_version=$(go list -m -f '{{.Version}}' github.com/caddyserver/caddy/v2)
+          echo "building against Caddy ${caddy_version}"
+          xcaddy build "${caddy_version}" \
+            --with github.com/team-swisscenter/caddy-tls-permission-allowlist=.
+
+      - name: Both modules must register
+        run: |
+          ./caddy list-modules | grep -x 'tls.permission.allowlist'
+          ./caddy list-modules | grep -x 'admin.api.permission_allowlist'
+          ./caddy version
