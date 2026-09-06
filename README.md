@@ -61,6 +61,24 @@ www.example.com
 customer-domain.net
 ```
 
+Every entry is validated as a hostname with the same rules certmagic applies to
+an SNI before asking for permission (RFC 1123 labels, punycode allowed, a
+unicode entry is mapped to its punycode form so it matches the name a handshake
+actually carries). Two kinds of bad line are treated differently:
+
+- **Corruption** — invalid UTF-8 or a control character anywhere in the file —
+  is never legitimate, so the **whole file is refused**: the last good list keeps
+  serving and the snapshot is left alone. Without this, 2000 bytes of
+  `/dev/urandom` were once adopted as a healthy 13-entry list, every real site
+  was refused after the next restart, and the snapshot was overwritten with the
+  noise.
+- **An individually invalid hostname** — an underscore, a misplaced hyphen, an
+  over-long label, a wildcard — can legitimately arrive from a customer's
+  `ServerAlias`. Such a name could never be issued a certificate anyway, so it
+  is **skipped** and reported at ERROR with a count and examples, and the rest
+  of the file is adopted rather than freezing every other update on the host.
+  A file with nothing valid left is refused like an empty one.
+
 **Entries are literal hostnames, not patterns.** A line like `*.example.com` is
 matched literally and will therefore never match anything. This is deliberate:
 on-demand issues one certificate *per name*, so a wildcard entry would not mean

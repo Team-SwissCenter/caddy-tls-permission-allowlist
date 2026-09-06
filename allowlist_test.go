@@ -38,7 +38,10 @@ func TestNormalize(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	names := parse([]byte("a.example.com\n\n# a comment\nB.EXAMPLE.COM\n  c.example.com  \na.example.com\n"))
+	names, skipped, err := parse([]byte("a.example.com\n\n# a comment\nB.EXAMPLE.COM\n  c.example.com  \na.example.com\n"))
+	if err != nil || len(skipped) != 0 {
+		t.Fatalf("clean input: err = %v, skipped = %v", err, skipped)
+	}
 
 	// Duplicates collapse, case folds, comments and blanks are skipped.
 	if len(names) != 3 {
@@ -53,8 +56,8 @@ func TestParse(t *testing.T) {
 
 func TestParseEmptyInputs(t *testing.T) {
 	for _, in := range []string{"", "\n\n\n", "# only a comment\n", "   \n\t\n"} {
-		if got := parse([]byte(in)); len(got) != 0 {
-			t.Errorf("parse(%q) = %v, want empty", in, got)
+		if got, _, err := parse([]byte(in)); err != nil || len(got) != 0 {
+			t.Errorf("parse(%q) = %v, %v, want empty and no error", in, got, err)
 		}
 	}
 }
@@ -853,5 +856,141 @@ func TestStatusFollowsASuccessfulReload(t *testing.T) {
 	unregisterState(fresh)
 	if st := statusFor(t); st.From != "not_configured" {
 		t.Errorf("status with no live instance = %+v, want not_configured", st)
+	}
+}
+
+// adoptFor runs adopt on raw for a module already serving one good name, and
+// returns the error, so tests can check both the verdict and what survived.
+func adoptFor(t *testing.T, p *Permission, raw string) error {
+	t.Helper()
+	return p.adopt(context.Background(), []byte(raw), "src", sourcePrimary)
+}
+
+func servingGood(t *testing.T, logger *zap.Logger) *Permission {
+	t.Helper()
+	p := newTestPermission(t, "src")
+	p.logger = logger
+	if err := adoptFor(t, p, "good.example.com\n"); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestAdoptRefusesACorruptFile(t *testing.T) {
+	// Measured on a live host: 2000 bytes of /dev/urandom were adopted as a
+	// healthy 13-entry primary list, every real site was refused after the
+	// next restart, and the snapshot was overwritten with the noise. Bytes
+	// that are not text are never legitimate in this file: the whole file is
+	// refused, the last good list stays, and so does the snapshot.
+	for name, raw := range map[string]string{
+		"binary noise":            "\x00\x8f\x13garbage\x01\n\xfe\xff\n",
+		"control character":       "good.example.com\nbad\x07.example.com\n",
+		"invalid UTF-8":           "good.example.com\n\xff\xfe.example.com\n",
+		"junk spliced into names": "a.example.com\n\x00\x00\x00\x1b[0m\nb.example.com\n",
+	} {
+		p := servingGood(t, zap.NewNop())
+		if err := adoptFor(t, p, raw); err == nil {
+			t.Errorf("%s: adopted, want refused", name)
+		}
+		if _, ok := p.names["good.example.com"]; !ok || p.state.Entries != 1 {
+			t.Errorf("%s: a refused file cost the last good list: %+v", name, p.state)
+		}
+	}
+}
+
+func TestAdoptSkipsAnInvalidHostname(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	p := servingGood(t, zap.New(core))
+
+	// Apache accepts an underscore ServerAlias, so a customer can create one
+	// through the panel at any time. Such a name can never get a certificate
+	// anyway -- SNI normalisation rejects it before the module is asked -- so
+	// refusing the whole file for it would freeze every other update on the
+	// host for nothing. Skip it, say so, adopt the rest.
+	err := adoptFor(t, p, "one.example.com\nunder_score.example.com\n-hyphen.example.com\ntwo.example.com\n")
+	if err != nil {
+		t.Fatalf("a file with an individually invalid hostname was refused: %v", err)
+	}
+	if p.state.Entries != 2 {
+		t.Errorf("entries = %d, want 2 (the valid ones)", p.state.Entries)
+	}
+	for _, want := range []string{"one.example.com", "two.example.com"} {
+		if _, ok := p.names[want]; !ok {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if _, ok := p.names["under_score.example.com"]; ok {
+		t.Error("an invalid hostname was adopted")
+	}
+	if n := errorLines(logs, "skipp"); n != 1 {
+		t.Errorf("%d lines about skipped entries, want exactly 1 (with the count)", n)
+	}
+}
+
+func TestAdoptRefusesWhenNothingValidRemains(t *testing.T) {
+	// Text junk without control characters is skipped line by line -- and
+	// with nothing left the existing empty-list rule refuses the file, by a
+	// different route to the same safe outcome.
+	p := servingGood(t, zap.NewNop())
+	if err := adoptFor(t, p, "hello world\n<?php echo 1; ?>\n!!!! broken !!!!\n"); err == nil {
+		t.Fatal("adopted a file with no valid hostname")
+	}
+	if p.state.Entries != 1 {
+		t.Errorf("a refused file changed state: %+v", p.state)
+	}
+}
+
+func TestHostnameValidation(t *testing.T) {
+	label63 := strings.Repeat("a", 63)
+	label64 := strings.Repeat("a", 64)
+	// 4 x 63 + 3 dots = 255 > 253.
+	tooLong := strings.Join([]string{label63, label63, label63, label63}, ".")
+
+	valid := []string{
+		"example.com",
+		"localhost", // single label: Caddy's internal issuer can serve it
+		"a-b.c",
+		"xn--bcher-kva.example", // punycode must pass untouched
+		"2023.DEV.SwissCenter.COM.",
+		label63 + ".example.com",
+		"1.2.3.4", // digits-only labels are valid; SNI never carries an IP, harmless
+	}
+	invalid := []string{
+		"under_score.example.com",
+		"-hyphen.example.com",
+		"hyphen-.example.com",
+		"a..b",
+		label64 + ".example.com",
+		tooLong,
+		"*.example.com", // SNI never contains "*", so the entry could never match
+		"hello world",
+		"<?php echo 1; ?>",
+		"!!!! broken !!!!",
+		"example.com:443",
+	}
+	for _, name := range valid {
+		p := newTestPermission(t, "src")
+		if err := adoptFor(t, p, name+"\n"); err != nil {
+			t.Errorf("valid %q refused: %v", name, err)
+		}
+	}
+	for _, name := range invalid {
+		p := newTestPermission(t, "src")
+		if err := adoptFor(t, p, name+"\n"); err == nil {
+			t.Errorf("invalid %q accepted (adopted %d names)", name, p.state.Entries)
+		}
+	}
+}
+
+func TestUnicodeEntryMatchesPunycodeSNI(t *testing.T) {
+	// The SNI arrives in punycode; certmagic runs it through idna before
+	// asking. An entry written in unicode must be mapped the same way, or it
+	// silently never matches.
+	p := newTestPermission(t, "src")
+	if err := adoptFor(t, p, "bücher.example\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CertificateAllowed(context.Background(), "xn--bcher-kva.example"); err != nil {
+		t.Errorf("unicode entry did not match its punycode SNI: %v", err)
 	}
 }

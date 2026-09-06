@@ -27,13 +27,23 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"golang.org/x/net/idna"
 )
+
+// hostnames validates and maps an allow-list entry the way certmagic maps an
+// SNI before asking for permission -- the idna.Lookup rules: STD3 characters
+// only, hyphen and joiner placement, bidi -- plus the DNS length limits that
+// profile leaves out. The two sides must agree, or an entry never matches the
+// name a handshake actually carries.
+var hostnames = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.VerifyDNSLength(true))
 
 const (
 	defaultReloadInterval = 2 * time.Second
@@ -456,9 +466,12 @@ func (p *Permission) loadInitial(ctx context.Context) {
 // file, and adopting one would take every site offline until the next good
 // write.
 func (p *Permission) adopt(ctx context.Context, raw []byte, path, origin string) error {
-	names := parse(raw)
+	names, skipped, err := parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
 	if len(names) == 0 {
-		return fmt.Errorf("%s parsed to zero names; refusing to adopt an empty allow-list", path)
+		return fmt.Errorf("%s parsed to zero valid names; refusing to adopt an empty allow-list", path)
 	}
 
 	// Error is deliberately not touched here: recordSourceResult owns it. A
@@ -476,6 +489,14 @@ func (p *Permission) adopt(ctx context.Context, raw []byte, path, origin string)
 
 	p.logger.Info("loaded on-demand allow-list",
 		zap.String("from", origin), zap.String("path", path), zap.Int("entries", len(names)))
+	if len(skipped) > 0 {
+		// ERROR rather than Warn for the same reason as elsewhere: a host
+		// logging at ERROR must still see it. Not a flood: adopt runs only
+		// when the content changes.
+		p.logger.Error("skipped entries that are not valid hostnames; they could never be issued a certificate",
+			zap.String("path", path), zap.Int("skipped", len(skipped)),
+			zap.Strings("examples", skipped[:min(len(skipped), 5)]))
+	}
 
 	if origin == sourcePrimary && p.snapshotEnabled() {
 		p.writeSnapshot(ctx, names)
@@ -485,16 +506,44 @@ func (p *Permission) adopt(ctx context.Context, raw []byte, path, origin string)
 
 func hashOf(raw []byte) [32]byte { return sha256.Sum256(raw) }
 
-func parse(raw []byte) map[string]struct{} {
-	names := make(map[string]struct{})
-	for _, line := range strings.Split(string(raw), "\n") {
+// parse splits raw into validated, normalized names, and returns the lines it
+// skipped.
+//
+// Two kinds of bad line, treated differently. Bytes that are not text -- invalid
+// UTF-8 or a control character -- are never legitimate here: the file is
+// corrupt, and the whole of it is refused so the last good list and the
+// snapshot survive. (Measured before this check existed: 2000 bytes of
+// /dev/urandom were adopted as a healthy 13-entry list, every real site was
+// refused after the next restart, and the snapshot was overwritten with the
+// noise.) A line that is text but not a valid hostname -- an underscore, a
+// misplaced hyphen, an over-long label -- can legitimately arrive from a
+// customer's ServerAlias; such a name could never be issued a certificate
+// anyway, so it is skipped and reported rather than freezing every other
+// update on the host. Nothing valid left falls through to the empty-list rule.
+//
+// Entries are mapped the way certmagic maps an SNI before asking (lowercase,
+// punycode), so an entry written in unicode matches the handshake's name.
+func parse(raw []byte) (names map[string]struct{}, skipped []string, err error) {
+	if !utf8.Valid(raw) {
+		return nil, nil, errors.New("not valid UTF-8; refusing to adopt a corrupt allow-list")
+	}
+	names = make(map[string]struct{})
+	for n, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		names[normalize(line)] = struct{}{}
+		if strings.ContainsFunc(line, unicode.IsControl) {
+			return nil, nil, fmt.Errorf("line %d contains control characters; refusing to adopt a corrupt allow-list", n+1)
+		}
+		name, err := hostnames.ToASCII(normalize(line))
+		if err != nil {
+			skipped = append(skipped, line)
+			continue
+		}
+		names[name] = struct{}{}
 	}
-	return names
+	return names, skipped, nil
 }
 
 // writeSnapshot persists the current good list, sorted and normalized. Only ever
